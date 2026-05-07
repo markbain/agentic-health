@@ -1,0 +1,372 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+from dataclasses import dataclass, field
+from typing import Optional
+import re
+
+# Try to import colorama, but don't fail if unavailable
+try:
+    from colorama import Fore, Style, init as colorama_init
+    HAS_COLORAMA = True
+    colorama_init(autoreset=True)
+except ImportError:
+    HAS_COLORAMA = False
+    class Fore:
+        RED = GREEN = YELLOW = ""
+    class Style:
+        RESET_ALL = ""
+
+# Constants
+ROOTS = [Path.home() / "code", Path.home() / "Dropbox"]
+MAX_DEPTH = 2
+MIN_FILES_TO_QUALIFY = 3
+
+# Scoring weights
+GATE_CHECKS = {
+    "claude_dir": 20,
+    "claude_md": 20,
+    "readme_md": 15,
+}
+
+POST_GATE_CHECKS = {
+    "git_dir": 10,
+    "gitignore": 5,
+    "claude_md_word_count": 5,
+    "claude_md_what_is_this": 8,
+    "claude_md_conventions": 8,
+    "claude_md_caution": 9,
+}
+
+@dataclass
+class AuditResult:
+    path: Path
+    score: int
+    failures: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    passes: list[str] = field(default_factory=list)
+    gated: bool = False
+
+def get_relative_path(path: Path) -> str:
+    """Return a user-friendly relative path."""
+    try:
+        return f"~/{path.relative_to(Path.home())}"
+    except ValueError:
+        return str(path)
+
+def discover_projects(roots: list[Path]) -> list[Path]:
+    """Walk roots up to MAX_DEPTH, identify projects."""
+    projects = []
+
+    for root in roots:
+        if not root.exists():
+            continue
+
+        # Helper to count depth from root
+        def walk_with_depth(current: Path, depth: int) -> None:
+            if depth > MAX_DEPTH:
+                return
+
+            try:
+                entries = list(current.iterdir())
+            except PermissionError:
+                print(f"⚠ Permission denied: {get_relative_path(current)}")
+                return
+
+            # Skip certain directories
+            entries = [e for e in entries if not e.name.startswith(".")
+                      and e.name not in ("node_modules", "vendor", ".git")]
+
+            # Check if current directory is a project
+            is_project = False
+
+            # Has .git?
+            if (current / ".git").exists():
+                is_project = True
+            # Or is direct child of root with 3+ items?
+            elif depth == 1 and len(entries) >= MIN_FILES_TO_QUALIFY:
+                is_project = True
+
+            if is_project and current != root:
+                projects.append(current)
+
+            # Recurse to next level (only if we're not at max depth)
+            if depth < MAX_DEPTH:
+                for entry in entries:
+                    if entry.is_dir():
+                        walk_with_depth(entry, depth + 1)
+
+        walk_with_depth(root, 0)
+
+    return sorted(projects)
+
+def read_file_safe(path: Path) -> Optional[str]:
+    """Read file, return None on error."""
+    try:
+        return path.read_text(encoding="utf-8")
+    except (FileNotFoundError, PermissionError, UnicodeDecodeError):
+        return None
+
+def count_words(text: str) -> int:
+    """Count words in text."""
+    return len(text.split())
+
+def has_keywords(text: str, keywords: list[str]) -> bool:
+    """Check if text contains any of the keywords (case-insensitive)."""
+    text_lower = text.lower()
+    return any(kw.lower() in text_lower for kw in keywords)
+
+def audit_project(path: Path) -> AuditResult:
+    """Audit a project and return results."""
+    result = AuditResult(path=path, score=0)
+
+    # GATE CHECKS
+    # Check 1: .claude directory
+    if not (path / ".claude").is_dir():
+        result.failures.append(".claude directory missing")
+        result.gated = True
+        return result
+    result.passes.append(".claude directory present")
+    result.score += GATE_CHECKS["claude_dir"]
+
+    # Check 2: CLAUDE.md file
+    if not (path / "CLAUDE.md").is_file():
+        result.failures.append("CLAUDE.md missing")
+        result.gated = True
+        return result
+    result.passes.append("CLAUDE.md present")
+    result.score += GATE_CHECKS["claude_md"]
+
+    # Check 3: README.md file
+    if not (path / "README.md").is_file():
+        result.failures.append("README.md missing")
+        result.gated = True
+        return result
+    result.passes.append("README.md present")
+    result.score += GATE_CHECKS["readme_md"]
+
+    # POST-GATE CHECKS
+
+    # Check 4: .git directory (optional for Dropbox)
+    if (path / ".git").is_dir():
+        result.passes.append(".git present")
+        result.score += POST_GATE_CHECKS["git_dir"]
+
+        # Check 5: .gitignore (only if .git exists)
+        if (path / ".gitignore").is_file():
+            result.passes.append(".gitignore present")
+            result.score += POST_GATE_CHECKS["gitignore"]
+        else:
+            result.warnings.append(".gitignore missing")
+    else:
+        result.warnings.append(".git not present")
+
+    # Check 6: CLAUDE.md word count
+    claude_content = read_file_safe(path / "CLAUDE.md")
+    if claude_content:
+        word_count = count_words(claude_content)
+        if word_count > 150:
+            result.passes.append(f"CLAUDE.md substantive ({word_count} words)")
+            result.score += POST_GATE_CHECKS["claude_md_word_count"]
+        else:
+            result.warnings.append(f"CLAUDE.md is a stub ({word_count} words)")
+
+        # Check 7: CLAUDE.md what-is-this keywords
+        what_is_this_keywords = ["purpose", "about", "overview", "this project"]
+        if has_keywords(claude_content, what_is_this_keywords):
+            result.passes.append("CLAUDE.md has what-is-this signals")
+            result.score += POST_GATE_CHECKS["claude_md_what_is_this"]
+        else:
+            result.warnings.append("CLAUDE.md lacks what-is-this signals")
+
+        # Check 8: CLAUDE.md conventions keywords
+        conventions_keywords = ["convention", "rule", "always", "never", "don't"]
+        if has_keywords(claude_content, conventions_keywords):
+            result.passes.append("CLAUDE.md has conventions signals")
+            result.score += POST_GATE_CHECKS["claude_md_conventions"]
+        else:
+            result.warnings.append("CLAUDE.md lacks conventions signals")
+
+        # Check 9: CLAUDE.md caution keywords
+        caution_keywords = ["avoid", "do not", "careful", "warning", "important"]
+        if has_keywords(claude_content, caution_keywords):
+            result.passes.append("CLAUDE.md has caution signals")
+            result.score += POST_GATE_CHECKS["claude_md_caution"]
+        else:
+            result.warnings.append("CLAUDE.md lacks caution signals")
+
+    return result
+
+def render_progress_bar(score: int) -> str:
+    """Render a 10-char progress bar for a score (0-100)."""
+    filled = int(score / 10)
+    empty = 10 - filled
+    return "█" * filled + "░" * empty
+
+def render_report(results: list[AuditResult], verbose: bool = False) -> str:
+    """Render the report to a string."""
+    lines = []
+
+    # Summary section
+    for result in results:
+        rel_path = get_relative_path(result.path)
+        bar = render_progress_bar(result.score)
+
+        # Count issues
+        issue_str = ""
+        if result.failures or result.warnings:
+            parts = []
+            if result.failures:
+                parts.append(f"{len(result.failures)} failure{'s' if len(result.failures) != 1 else ''}")
+            if result.warnings:
+                parts.append(f"{len(result.warnings)} warning{'s' if len(result.warnings) != 1 else ''}")
+            issue_str = "  " + ", ".join(parts)
+
+        # Color code the line
+        if result.failures:
+            color = Fore.RED
+        elif result.warnings:
+            color = Fore.YELLOW
+        else:
+            color = Fore.GREEN
+
+        line = f"{color}{rel_path:<30} {bar}  {result.score}/100{issue_str}{Style.RESET_ALL}"
+        lines.append(line)
+
+    # Verbose: show all checks
+    if verbose:
+        lines.append("")
+        lines.append("ALL CHECKS")
+        for result in results:
+            rel_path = get_relative_path(result.path)
+            lines.append(f"\n{rel_path}")
+            for check in result.passes:
+                lines.append(f"  {Fore.GREEN}✓{Style.RESET_ALL} {check}")
+            for check in result.warnings:
+                lines.append(f"  {Fore.YELLOW}⚠{Style.RESET_ALL} {check}")
+            for check in result.failures:
+                lines.append(f"  {Fore.RED}✗{Style.RESET_ALL} {check}")
+    else:
+        # Non-verbose: show only failures and warnings
+        has_issues = any(r.failures or r.warnings for r in results)
+        if has_issues:
+            lines.append("")
+            lines.append("FAILURES AND WARNINGS")
+            for result in results:
+                if result.failures or result.warnings:
+                    rel_path = get_relative_path(result.path)
+                    lines.append(f"\n{rel_path}")
+                    for check in result.failures:
+                        lines.append(f"  {Fore.RED}✗{Style.RESET_ALL} {check}")
+                    for check in result.warnings:
+                        lines.append(f"  {Fore.YELLOW}⚠{Style.RESET_ALL} {check}")
+
+    return "\n".join(lines)
+
+def write_markdown_report(results: list[AuditResult], output_path: Path) -> None:
+    """Write markdown report to file."""
+    lines = []
+    lines.append("# Project Health Report")
+    lines.append("")
+
+    # Summary table
+    lines.append("## Summary")
+    lines.append("")
+    lines.append("| Project | Score | Issues |")
+    lines.append("|---------|-------|--------|")
+    for result in results:
+        rel_path = get_relative_path(result.path)
+        issues_str = ""
+        if result.failures or result.warnings:
+            parts = []
+            if result.failures:
+                parts.append(f"{len(result.failures)}F")
+            if result.warnings:
+                parts.append(f"{len(result.warnings)}W")
+            issues_str = " / ".join(parts)
+        lines.append(f"| {rel_path} | {result.score}/100 | {issues_str} |")
+
+    lines.append("")
+
+    # Details
+    lines.append("## Details")
+    for result in results:
+        if result.failures or result.warnings:
+            rel_path = get_relative_path(result.path)
+            lines.append(f"\n### {rel_path}")
+            if result.failures:
+                lines.append(f"\n**Failures:**")
+                for check in result.failures:
+                    lines.append(f"- {check}")
+            if result.warnings:
+                lines.append(f"\n**Warnings:**")
+                for check in result.warnings:
+                    lines.append(f"- {check}")
+
+    output_path.write_text("\n".join(lines))
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Audit projects for agent-readiness"
+    )
+    parser.add_argument(
+        "path",
+        nargs="?",
+        help="Path to audit (default: both ~/code and ~/Dropbox)"
+    )
+    parser.add_argument(
+        "--markdown",
+        action="store_true",
+        help="Write markdown report to ~/project-health-report.md"
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Show all checks including passes"
+    )
+
+    args = parser.parse_args()
+
+    # Determine what to audit
+    if args.path:
+        targets = [Path(args.path).expanduser()]
+    else:
+        targets = ROOTS
+
+    # Discover projects
+    projects = []
+    for target in targets:
+        if target.exists() and target.is_dir():
+            if (target / ".git").exists() or (target / ".claude").exists():
+                # It's a project itself
+                projects.append(target)
+            else:
+                # Discover projects under it
+                projects.extend(discover_projects([target]))
+        else:
+            print(f"✗ Path not found: {target}")
+            sys.exit(1)
+
+    if not projects:
+        print("No projects found.")
+        sys.exit(0)
+
+    # Audit all projects
+    results = [audit_project(p) for p in projects]
+
+    # Render and print report
+    report = render_report(results, verbose=args.verbose)
+    print(report)
+
+    # Write markdown if requested
+    if args.markdown:
+        md_path = Path.home() / "project-health-report.md"
+        write_markdown_report(results, md_path)
+        print(f"\nMarkdown report written to {get_relative_path(md_path)}")
+
+if __name__ == "__main__":
+    main()
