@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import json
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
@@ -21,10 +22,39 @@ except ImportError:
     class Style:
         RESET_ALL = ""
 
-# Constants
-ROOTS = [Path.home() / "code", Path.home() / "Dropbox"]
-MAX_DEPTH = 2
-MIN_FILES_TO_QUALIFY = 3
+# Default constants
+DEFAULT_ROOTS = [Path.home() / "code", Path.home() / "Dropbox"]
+DEFAULT_MAX_DEPTH = 2
+DEFAULT_MIN_FILES = 3
+CONFIG_PATHS = [
+    Path.home() / ".project-health.json",
+    Path.home() / ".config" / "project-health" / "config.json",
+]
+
+def load_config(config_path: Optional[Path] = None) -> dict:
+    """Load config from file, return defaults if not found."""
+    if config_path:
+        paths_to_check = [config_path]
+    else:
+        paths_to_check = CONFIG_PATHS
+
+    for path in paths_to_check:
+        if path.exists():
+            try:
+                return json.loads(path.read_text())
+            except (json.JSONDecodeError, IOError):
+                continue
+
+    # Return default config
+    return {
+        "roots": [str(p) for p in DEFAULT_ROOTS],
+        "max_depth": DEFAULT_MAX_DEPTH,
+        "min_files_to_qualify": DEFAULT_MIN_FILES,
+    }
+
+def expand_paths(paths: list[str]) -> list[Path]:
+    """Expand ~/ paths and convert to Path objects."""
+    return [Path(p).expanduser() for p in paths]
 
 # Scoring weights
 GATE_CHECKS = {
@@ -58,8 +88,8 @@ def get_relative_path(path: Path) -> str:
     except ValueError:
         return str(path)
 
-def discover_projects(roots: list[Path]) -> list[Path]:
-    """Walk roots up to MAX_DEPTH, identify projects."""
+def discover_projects(roots: list[Path], max_depth: int, min_files: int) -> list[Path]:
+    """Walk roots up to max_depth, identify projects."""
     projects = []
 
     for root in roots:
@@ -68,7 +98,7 @@ def discover_projects(roots: list[Path]) -> list[Path]:
 
         # Helper to count depth from root
         def walk_with_depth(current: Path, depth: int) -> None:
-            if depth > MAX_DEPTH:
+            if depth > max_depth:
                 return
 
             try:
@@ -87,15 +117,15 @@ def discover_projects(roots: list[Path]) -> list[Path]:
             # Has .git?
             if (current / ".git").exists():
                 is_project = True
-            # Or is direct child of root with 3+ items?
-            elif depth == 1 and len(entries) >= MIN_FILES_TO_QUALIFY:
+            # Or is direct child of root with min_files+ items?
+            elif depth == 1 and len(entries) >= min_files:
                 is_project = True
 
             if is_project and current != root:
                 projects.append(current)
 
             # Recurse to next level (only if we're not at max depth)
-            if depth < MAX_DEPTH:
+            if depth < max_depth:
                 for entry in entries:
                     if entry.is_dir():
                         walk_with_depth(entry, depth + 1)
@@ -316,7 +346,21 @@ def main():
     parser.add_argument(
         "path",
         nargs="?",
-        help="Path to audit (default: both ~/code and ~/Dropbox)"
+        help="Path to audit (default: use configured roots)"
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        help="Path to config file (default: ~/.project-health.json or ~/.config/project-health/config.json)"
+    )
+    parser.add_argument(
+        "--roots",
+        help="Comma-separated list of root directories to scan (overrides config)"
+    )
+    parser.add_argument(
+        "--depth",
+        type=int,
+        help="Maximum depth to scan (overrides config, default: 2)"
     )
     parser.add_argument(
         "--markdown",
@@ -331,22 +375,31 @@ def main():
 
     args = parser.parse_args()
 
-    # Determine what to audit
-    if args.path:
-        targets = [Path(args.path).expanduser()]
+    # Load config
+    config = load_config(args.config)
+
+    # Determine roots (command-line > config)
+    if args.roots:
+        roots = expand_paths(args.roots.split(","))
+    elif args.path:
+        roots = [Path(args.path).expanduser()]
     else:
-        targets = ROOTS
+        roots = expand_paths(config.get("roots", [str(p) for p in DEFAULT_ROOTS]))
+
+    # Determine max depth (command-line > config > default)
+    max_depth = args.depth if args.depth is not None else config.get("max_depth", DEFAULT_MAX_DEPTH)
+    min_files = config.get("min_files_to_qualify", DEFAULT_MIN_FILES)
 
     # Discover projects
     projects = []
-    for target in targets:
+    for target in roots:
         if target.exists() and target.is_dir():
             if (target / ".git").exists() or (target / ".claude").exists():
                 # It's a project itself
                 projects.append(target)
             else:
                 # Discover projects under it
-                projects.extend(discover_projects([target]))
+                projects.extend(discover_projects([target], max_depth, min_files))
         else:
             print(f"✗ Path not found: {target}")
             sys.exit(1)
