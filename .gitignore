@@ -32,3 +32,9 @@ env/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# Local project-health report
+project-health-report.md
